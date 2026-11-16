@@ -1,0 +1,99 @@
+#import "diff"
+
+Limit :: 4096;
+
+Case :: struct {
+    old: [256]u8
+    new: [256]u8
+    old_length: s64
+    new_length: s64
+    old_starts: [64]s64
+    new_starts: [64]s64
+    old_hashes: [64]u64
+    new_hashes: [64]u64
+    forward: [160]s64
+    backward: [160]s64
+    raw: [1000]s64
+    ops: [1000]s64
+    count: s64
+    out: [4096]u8
+    length: s64
+}
+
+Copy :: (text: string, into: *u8) -> s64 {
+    at: s64 = 0
+    while at < text.count {
+        into[at] = text[at]
+        at += 1
+    }
+    return text.count
+}
+
+// Diffs old against new and checks the unified text (headers "a" and "b").
+Check :: (c: *Case, old: string, new: string, context: s64, expected: string) -> bool {
+    c.old_length = Copy(old, *c.old[0])
+    c.new_length = Copy(new, *c.new[0])
+    c.count = DiffLines(*c.old[0], c.old_length, *c.new[0], c.new_length, 0,
+        *c.old_starts[0], *c.new_starts[0], *c.old_hashes[0], *c.new_hashes[0],
+        *c.forward[0], *c.backward[0], *c.raw[0], *c.ops[0], 200)
+    if c.count < 0 { return false }
+    a: [1]u8
+    b: [1]u8
+    a[0] = cast(u8)97
+    b[0] = cast(u8)98
+    c.length = DiffUnified(*c.old[0], *c.new[0], *c.old_starts[0], *c.new_starts[0],
+        *c.ops[0], c.count, context, 1, *a[0], 1, *b[0], 1, *c.out[0], Limit)
+    if c.length != expected.count { return false }
+    at: s64 = 0
+    while at < c.length {
+        if c.out[at] != expected[at] { return false }
+        at += 1
+    }
+    return true
+}
+
+Parsed :: struct {
+    text: [512]u8
+    header: [6]s64
+    hunks: [64]s64
+    lines: [96]s64
+    count: s64
+}
+
+Parse :: (p: *Parsed, text: string) -> s64 {
+    length := Copy(text, *p.text[0])
+    p.count = DiffParseUnified(*p.text[0], length, *p.header[0], *p.hunks[0], 8, *p.lines[0], 32)
+    return p.count
+}
+
+#program_export
+main :: () -> s32 {
+    c: Case
+    if DiffLineCount(null, 0) != 0 { return 1 }
+    if !Check(*c, "a\nb\nc\n", "a\nb\nc\n", 3, "") { return 2 }
+    if !Check(*c, "a\nb\nc\n", "a\nx\nc\n", 3,
+        "--- a\n+++ b\n@@ -1,3 +1,3 @@\n a\n-b\n+x\n c\n") { return 3 }
+    if !Check(*c, "a\n", "a\nb", 3,
+        "--- a\n+++ b\n@@ -1 +1,2 @@\n a\n+b\n\\ No newline at end of file\n") { return 4 }
+    if !Check(*c, "", "x\n", 3, "--- a\n+++ b\n@@ -0,0 +1 @@\n+x\n") { return 5 }
+    if !Check(*c, "x\r\ny\r\n", "y\r\n", 1, "--- a\n+++ b\n@@ -1,2 +1 @@\n-x\r\n y\r\n") { return 6 }
+    // Two changes far apart become two hunks.
+    if !Check(*c, "1\n2\n3\n4\n5\n6\n7\n8\n", "0\n2\n3\n4\n5\n6\n7\n9\n", 1,
+        "--- a\n+++ b\n@@ -1,2 +1,2 @@\n-1\n+0\n 2\n@@ -7,2 +7,2 @@\n 7\n-8\n+9\n") { return 7 }
+    p: Parsed
+    if Parse(*p, "diff --git x y\n--- a\n+++ \"b\\tc\"\t2026\n@@ -1,2 +1,2 @@ fn x\n-1\n+0\n 2\n@@ -7,2 +7,2 @@\n 7\n-8\n+9\n\\ No newline at end of file\n") != 2 { return 8 }
+    if p.header[0] != 19 || p.header[1] != 20 || p.header[2] != 0 ||
+       p.header[4] - p.header[3] != 6 || p.header[5] != 1 { return 9 }
+    if p.hunks[0] != 1 || p.hunks[1] != 2 || p.hunks[4] != 0 || p.hunks[5] != 3 ||
+       p.hunks[6] < 0 || p.hunks[7] - p.hunks[6] != 5 || p.hunks[14] != -1 { return 10 }
+    if p.hunks[8] != 7 || p.hunks[12] != 3 || p.hunks[13] != 3 { return 11 }
+    // "+9" lost its newline to the marker.
+    if p.lines[15] != DiffInsert || p.lines[17] - p.lines[16] != 1 { return 12 }
+    if Parse(*p, "@@ -1 +1 @@\n-a\n") != DiffParseError { return 13 }
+    if Parse(*p, "@@ -2 +2 @@\n a\n@@ -1 +1 @@\n b\n") != DiffParseError { return 14 }
+    if Parse(*p, "--- a\n--- b\n") != DiffParseError { return 15 }
+    if Parse(*p, "--- a\n+++ b\n") != 0 { return 16 }
+    if Parse(*p, "@@ -1,2 +1,2 @@\n a\n\\ No newline at end of file\n b\n") != DiffParseError { return 17 }
+    if Parse(*p, "@@ -0,0 +1 @@\n+x\n") != 1 || p.lines[0] != DiffInsert { return 18 }
+    return 0
+}

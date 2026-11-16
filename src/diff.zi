@@ -1,0 +1,1142 @@
+// Line diffs and unified diff text. The algorithm is the Myers
+// divide-and-conquer diff with the post-passes of Rust's `similar` crate
+// (compaction, then delete/insert pairs merged into replacements), so its
+// unified output matches `similar::TextDiff::from_lines(..).unified_diff()`
+// byte for byte. Everything is allocation-free: callers own the text, the
+// workspace and the output.
+//
+// Lines keep their terminator: "\n", "\r\n" or a lone "\r". A final line
+// without one is reported with "\ No newline at end of file".
+//
+// Ops are records of five s64 values: tag, old index, old length, new index,
+// new length (an equal op stores its length in both length fields).
+// Workspace sizes for `old_count` and `new_count` lines (see DiffLineCount):
+//   old_starts: old_count + 1, new_starts: new_count + 1     (s64)
+//   old_hashes: old_count,     new_hashes: new_count         (u64)
+//   forward, backward: 2 * ((old_count + new_count + 1) / 2 + 1) + 2   (s64)
+//   raw_ops, ops: 5 * DiffOpCapacity(old_count, new_count)            (s64)
+
+DiffEqual :: 0;
+DiffDelete :: 1;
+DiffInsert :: 2;
+DiffReplace :: 3;
+
+DiffInvalid :: -2;
+DiffNoRoom :: -1;
+
+Fields :: 5;
+
+Work :: struct {
+    old_text: *u8
+    new_text: *u8
+    old_starts: *s64
+    new_starts: *s64
+    old_hashes: *u64
+    new_hashes: *u64
+    forward: *s64
+    backward: *s64
+    offset: s64
+    raw: *s64
+    raw_count: s64
+    ops: *s64
+    count: s64
+    capacity: s64
+    budget: s64
+    spent: s64
+    exhausted: bool
+    overflow: bool
+}
+
+// Number of lines in text, splitting after "\n", "\r\n" and a lone "\r".
+#program_export
+DiffLineCount :: (text: *u8, length: s64) -> s64 {
+    if length <= 0 || text == null { return 0 }
+    count: s64 = 0
+    at: s64 = 0
+    last: s64 = 0
+    while at < length {
+        byte := text[at]
+        if byte == cast(u8)13 {
+            if at + 1 < length && text[at + 1] == cast(u8)10 { at += 1 }
+            count += 1
+            last = at + 1
+        } else if byte == cast(u8)10 {
+            count += 1
+            last = at + 1
+        }
+        at += 1
+    }
+    if last < length { count += 1 }
+    return count
+}
+
+// Upper bound on the ops a diff of these line counts can produce.
+#program_export
+DiffOpCapacity :: (old_count: s64, new_count: s64) -> s64 {
+    return 2 * (old_count + new_count) + 8
+}
+
+// Writes count + 1 line starts; the last entry is the text length.
+SplitLines :: (text: *u8, length: s64, starts: *s64) -> s64 {
+    count: s64 = 0
+    at: s64 = 0
+    starts[0] = 0
+    last: s64 = 0
+    while at < length {
+        byte := text[at]
+        ended := false
+        if byte == cast(u8)13 {
+            if at + 1 < length && text[at + 1] == cast(u8)10 { at += 1 }
+            ended = true
+        } else if byte == cast(u8)10 {
+            ended = true
+        }
+        at += 1
+        if ended {
+            count += 1
+            starts[count] = at
+            last = at
+        }
+    }
+    if last < length {
+        count += 1
+        starts[count] = length
+    }
+    return count
+}
+
+HashLines :: (text: *u8, starts: *s64, count: s64, hashes: *u64) {
+    line: s64 = 0
+    while line < count {
+        hash: u64 = cast(u64)14695981039346656037
+        at := starts[line]
+        end := starts[line + 1]
+        while at < end {
+            hash = (hash ^ cast(u64)text[at]) * cast(u64)1099511628211
+            at += 1
+        }
+        hashes[line] = hash
+        line += 1
+    }
+}
+
+// old line `i` equals new line `j`.
+Same :: (w: *Work, i: s64, j: s64) -> bool {
+    if w.old_hashes[i] != w.new_hashes[j] { return false }
+    a := w.old_starts[i]
+    a_end := w.old_starts[i + 1]
+    b := w.new_starts[j]
+    b_end := w.new_starts[j + 1]
+    if a_end - a != b_end - b { return false }
+    while a < a_end {
+        if w.old_text[a] != w.new_text[b] { return false }
+        a += 1
+        b += 1
+    }
+    return true
+}
+
+PrefixLength :: (w: *Work, old_start: s64, old_end: s64, new_start: s64, new_end: s64) -> s64 {
+    if old_start >= old_end || new_start >= new_end { return 0 }
+    count: s64 = 0
+    while old_start + count < old_end && new_start + count < new_end &&
+          Same(w, old_start + count, new_start + count) {
+        count += 1
+    }
+    w.spent += count
+    return count
+}
+
+SuffixLength :: (w: *Work, old_start: s64, old_end: s64, new_start: s64, new_end: s64) -> s64 {
+    if old_start >= old_end || new_start >= new_end { return 0 }
+    count: s64 = 0
+    while old_end - count > old_start && new_end - count > new_start &&
+          Same(w, old_end - count - 1, new_end - count - 1) {
+        count += 1
+    }
+    w.spent += count
+    return count
+}
+
+Abs :: (value: s64) -> s64 { return ifx value < 0 then -value else value }
+
+MaxD :: (a: s64, b: s64) -> s64 { return (a + b + 1) / 2 + 1 }
+
+// Raw hook output, compacted later.
+PushRaw :: (w: *Work, tag: s64, old_index: s64, old_len: s64, new_index: s64, new_len: s64) {
+    if w.raw_count >= w.capacity {
+        w.overflow = true
+        return
+    }
+    at := w.raw_count * Fields
+    w.raw[at] = tag
+    w.raw[at + 1] = old_index
+    w.raw[at + 2] = old_len
+    w.raw[at + 3] = new_index
+    w.raw[at + 4] = new_len
+    w.raw_count += 1
+}
+
+// Returns false when the budget ran out (the caller then emits delete+insert).
+MiddleSnake :: (w: *Work, old_start: s64, old_end: s64, new_start: s64, new_end: s64,
+                found_x: *s64, found_y: *s64) -> bool {
+    n := old_end - old_start
+    m := new_end - new_start
+    delta := n - m
+    odd := (delta & 1) == 1
+    vf := w.forward
+    vb := w.backward
+    o := w.offset
+    vf[o + 1] = 0
+    vb[o + 1] = 0
+    d_max := MaxD(n, m)
+    d: s64 = 0
+    while d < d_max {
+        if w.budget > 0 && w.spent >= w.budget { w.exhausted = true }
+        if w.exhausted { return false }
+        k := d
+        while k >= -d {
+            x: s64 = 0
+            if k == -d || (k != d && vf[o + k - 1] < vf[o + k + 1]) {
+                x = vf[o + k + 1]
+            } else {
+                x = vf[o + k - 1] + 1
+            }
+            y := x - k
+            x0 := x
+            y0 := y
+            if x < n && y < m {
+                x += PrefixLength(w, old_start + x, old_end, new_start + y, new_end)
+            }
+            vf[o + k] = x
+            w.spent += 1
+            if odd && Abs(k - delta) <= d - 1 {
+                if vf[o + k] + vb[o - (k - delta)] >= n {
+                    found_x.* = x0 + old_start
+                    found_y.* = y0 + new_start
+                    return true
+                }
+            }
+            k -= 2
+        }
+        k = d
+        while k >= -d {
+            x: s64 = 0
+            if k == -d || (k != d && vb[o + k - 1] < vb[o + k + 1]) {
+                x = vb[o + k + 1]
+            } else {
+                x = vb[o + k - 1] + 1
+            }
+            y := x - k
+            if x < n && y < m {
+                advance := SuffixLength(w, old_start, old_start + n - x, new_start, new_start + m - y)
+                x += advance
+                y += advance
+            }
+            vb[o + k] = x
+            w.spent += 1
+            if !odd && Abs(k - delta) <= d {
+                if vb[o + k] + vf[o - (k - delta)] >= n {
+                    found_x.* = n - x + old_start
+                    found_y.* = m - y + new_start
+                    return true
+                }
+            }
+            k -= 2
+        }
+        d += 1
+    }
+    return false
+}
+
+Conquer :: (w: *Work, old_start_in: s64, old_end_in: s64, new_start_in: s64, new_end_in: s64) {
+    old_start := old_start_in
+    old_end := old_end_in
+    new_start := new_start_in
+    new_end := new_end_in
+    prefix := PrefixLength(w, old_start, old_end, new_start, new_end)
+    if prefix > 0 { PushRaw(w, DiffEqual, old_start, prefix, new_start, prefix) }
+    old_start += prefix
+    new_start += prefix
+    suffix := SuffixLength(w, old_start, old_end, new_start, new_end)
+    suffix_old := old_end - suffix
+    suffix_new := new_end - suffix
+    old_end -= suffix
+    new_end -= suffix
+    if old_start >= old_end && new_start >= new_end {
+    } else if new_start >= new_end {
+        PushRaw(w, DiffDelete, old_start, old_end - old_start, new_start, 0)
+    } else if old_start >= old_end {
+        PushRaw(w, DiffInsert, old_start, 0, new_start, new_end - new_start)
+    } else {
+        x: s64 = 0
+        y: s64 = 0
+        if MiddleSnake(w, old_start, old_end, new_start, new_end, *x, *y) {
+            Conquer(w, old_start, x, new_start, y)
+            Conquer(w, x, old_end, y, new_end)
+        } else {
+            PushRaw(w, DiffDelete, old_start, old_end - old_start, new_start, 0)
+            PushRaw(w, DiffInsert, old_start, 0, new_start, new_end - new_start)
+        }
+    }
+    if suffix > 0 { PushRaw(w, DiffEqual, suffix_old, suffix, suffix_new, suffix) }
+}
+
+// ---- Compaction (similar::algorithms::Compact) over the raw ops ----
+
+Tag :: (ops: *s64, i: s64) -> s64 { return ops[i * Fields] }
+OldIndex :: (ops: *s64, i: s64) -> s64 { return ops[i * Fields + 1] }
+OldLen :: (ops: *s64, i: s64) -> s64 { return ops[i * Fields + 2] }
+NewIndex :: (ops: *s64, i: s64) -> s64 { return ops[i * Fields + 3] }
+NewLen :: (ops: *s64, i: s64) -> s64 { return ops[i * Fields + 4] }
+
+// Offsets move both indices; lengths change the lengths the op's tag owns.
+Adjust :: (ops: *s64, i: s64, offset: s64, length: s64) {
+    at := i * Fields
+    tag := ops[at]
+    ops[at + 1] += offset
+    ops[at + 3] += offset
+    if tag == DiffEqual || tag == DiffDelete || tag == DiffReplace { ops[at + 2] += length }
+    if tag == DiffEqual || tag == DiffInsert || tag == DiffReplace { ops[at + 4] += length }
+}
+ShiftLeft :: (ops: *s64, i: s64, by: s64) { Adjust(ops, i, -by, 0) }
+ShiftRight :: (ops: *s64, i: s64, by: s64) { Adjust(ops, i, by, 0) }
+GrowLeft :: (ops: *s64, i: s64, by: s64) { Adjust(ops, i, -by, by) }
+GrowRight :: (ops: *s64, i: s64, by: s64) { Adjust(ops, i, 0, by) }
+ShrinkLeft :: (ops: *s64, i: s64, by: s64) { Adjust(ops, i, 0, -by) }
+ShrinkRight :: (ops: *s64, i: s64, by: s64) { Adjust(ops, i, by, -by) }
+
+Empty :: (ops: *s64, i: s64) -> bool { return OldLen(ops, i) == 0 && NewLen(ops, i) == 0 }
+
+RemoveOp :: (w: *Work, i: s64) {
+    at := i * Fields
+    end := w.raw_count * Fields
+    while at + Fields < end {
+        w.raw[at] = w.raw[at + Fields]
+        at += 1
+    }
+    w.raw_count -= 1
+}
+
+InsertEqual :: (w: *Work, i: s64, old_index: s64, new_index: s64, length: s64) {
+    if w.raw_count >= w.capacity {
+        w.overflow = true
+        return
+    }
+    at := w.raw_count * Fields - 1
+    stop := i * Fields
+    while at >= stop {
+        w.raw[at + Fields] = w.raw[at]
+        at -= 1
+    }
+    w.raw[stop] = DiffEqual
+    w.raw[stop + 1] = old_index
+    w.raw[stop + 2] = length
+    w.raw[stop + 3] = new_index
+    w.raw[stop + 4] = length
+    w.raw_count += 1
+}
+
+SwapOps :: (ops: *s64, a: s64, b: s64) {
+    field: s64 = 0
+    while field < Fields {
+        value := ops[a * Fields + field]
+        ops[a * Fields + field] = ops[b * Fields + field]
+        ops[b * Fields + field] = value
+        field += 1
+    }
+}
+
+ShiftUp :: (w: *Work, pointer_in: s64) -> s64 {
+    pointer := pointer_in
+    ops := w.raw
+    while pointer >= 1 && !w.overflow {
+        this_tag := Tag(ops, pointer)
+        prev_tag := Tag(ops, pointer - 1)
+        // The ranges compare the previous op's old range with this op's new range.
+        prev_old := OldIndex(ops, pointer - 1)
+        prev_old_len := OldLen(ops, pointer - 1)
+        this_new := NewIndex(ops, pointer)
+        this_new_len := NewLen(ops, pointer)
+        if (this_tag == DiffInsert || this_tag == DiffDelete) && prev_tag == DiffEqual {
+            suffix := SuffixLength(w, prev_old, prev_old + prev_old_len, this_new, this_new + this_new_len)
+            if suffix > 0 {
+                if pointer + 1 < w.raw_count && Tag(ops, pointer + 1) == DiffEqual {
+                    GrowLeft(ops, pointer + 1, suffix)
+                } else {
+                    length := ifx this_tag == DiffInsert then suffix else prev_old_len - suffix
+                    InsertEqual(w, pointer + 1, prev_old + prev_old_len - suffix,
+                                this_new + this_new_len - suffix, length)
+                }
+                ShiftLeft(ops, pointer, suffix)
+                ShrinkLeft(ops, pointer - 1, suffix)
+                if Empty(ops, pointer - 1) {
+                    RemoveOp(w, pointer - 1)
+                    pointer -= 1
+                }
+            } else if Empty(ops, pointer - 1) {
+                RemoveOp(w, pointer - 1)
+                pointer -= 1
+            } else {
+                break
+            }
+        } else if (this_tag == DiffInsert && prev_tag == DiffDelete) ||
+                  (this_tag == DiffDelete && prev_tag == DiffInsert) {
+            SwapOps(ops, pointer - 1, pointer)
+            pointer -= 1
+        } else if this_tag == DiffInsert && prev_tag == DiffInsert {
+            GrowRight(ops, pointer - 1, this_new_len)
+            RemoveOp(w, pointer)
+            pointer -= 1
+        } else if this_tag == DiffDelete && prev_tag == DiffDelete {
+            GrowRight(ops, pointer - 1, OldLen(ops, pointer))
+            RemoveOp(w, pointer)
+            pointer -= 1
+        } else {
+            break
+        }
+    }
+    return pointer
+}
+
+ShiftDown :: (w: *Work, pointer_in: s64) -> s64 {
+    pointer := pointer_in
+    ops := w.raw
+    while pointer + 1 < w.raw_count && !w.overflow {
+        this_tag := Tag(ops, pointer)
+        next_tag := Tag(ops, pointer + 1)
+        next_old := OldIndex(ops, pointer + 1)
+        next_old_len := OldLen(ops, pointer + 1)
+        this_new := NewIndex(ops, pointer)
+        this_new_len := NewLen(ops, pointer)
+        if (this_tag == DiffInsert || this_tag == DiffDelete) && next_tag == DiffEqual {
+            prefix := PrefixLength(w, next_old, next_old + next_old_len, this_new, this_new + this_new_len)
+            if prefix > 0 {
+                if pointer >= 1 && Tag(ops, pointer - 1) == DiffEqual {
+                    GrowRight(ops, pointer - 1, prefix)
+                } else {
+                    InsertEqual(w, pointer, next_old, this_new, prefix)
+                    pointer += 1
+                }
+                ShiftRight(ops, pointer, prefix)
+                ShrinkRight(ops, pointer + 1, prefix)
+                if Empty(ops, pointer + 1) { RemoveOp(w, pointer + 1) }
+            } else if Empty(ops, pointer + 1) {
+                RemoveOp(w, pointer + 1)
+            } else {
+                break
+            }
+        } else if (this_tag == DiffInsert && next_tag == DiffDelete) ||
+                  (this_tag == DiffDelete && next_tag == DiffInsert) {
+            SwapOps(ops, pointer, pointer + 1)
+            pointer += 1
+        } else if this_tag == DiffInsert && next_tag == DiffInsert {
+            GrowRight(ops, pointer, NewLen(ops, pointer + 1))
+            RemoveOp(w, pointer + 1)
+        } else if this_tag == DiffDelete && next_tag == DiffDelete {
+            GrowRight(ops, pointer, OldLen(ops, pointer + 1))
+            RemoveOp(w, pointer + 1)
+        } else {
+            break
+        }
+    }
+    return pointer
+}
+
+Cleanup :: (w: *Work) {
+    pass: s64 = 0
+    while pass < 2 {
+        wanted := ifx pass == 0 then DiffDelete else DiffInsert
+        pointer: s64 = 0
+        while pointer < w.raw_count && !w.overflow {
+            if Tag(w.raw, pointer) == wanted {
+                pointer = ShiftUp(w, pointer)
+                pointer = ShiftDown(w, pointer)
+            }
+            pointer += 1
+        }
+        pass += 1
+    }
+}
+
+// ---- Replace (similar::algorithms::Replace) into the final ops ----
+
+Pending :: struct {
+    has_eq: bool
+    eq_old: s64
+    eq_new: s64
+    eq_len: s64
+    has_del: bool
+    del_old: s64
+    del_len: s64
+    del_new: s64
+    has_ins: bool
+    ins_old: s64
+    ins_new: s64
+    ins_len: s64
+}
+
+Emit :: (w: *Work, tag: s64, old_index: s64, old_len: s64, new_index: s64, new_len: s64) {
+    if w.count >= w.capacity {
+        w.overflow = true
+        return
+    }
+    at := w.count * Fields
+    w.ops[at] = tag
+    w.ops[at + 1] = old_index
+    w.ops[at + 2] = old_len
+    w.ops[at + 3] = new_index
+    w.ops[at + 4] = new_len
+    w.count += 1
+}
+
+FlushEq :: (w: *Work, p: *Pending) {
+    if p.has_eq {
+        Emit(w, DiffEqual, p.eq_old, p.eq_len, p.eq_new, p.eq_len)
+        p.has_eq = false
+    }
+}
+
+FlushDelIns :: (w: *Work, p: *Pending) {
+    if p.has_del {
+        if p.has_ins {
+            Emit(w, DiffReplace, p.del_old, p.del_len, p.ins_new, p.ins_len)
+            p.has_ins = false
+        } else {
+            Emit(w, DiffDelete, p.del_old, p.del_len, p.del_new, 0)
+        }
+        p.has_del = false
+    } else if p.has_ins {
+        Emit(w, DiffInsert, p.ins_old, 0, p.ins_new, p.ins_len)
+        p.has_ins = false
+    }
+}
+
+ReplacePass :: (w: *Work) {
+    p: Pending
+    p.has_eq = false
+    p.has_del = false
+    p.has_ins = false
+    i: s64 = 0
+    while i < w.raw_count {
+        tag := Tag(w.raw, i)
+        old_index := OldIndex(w.raw, i)
+        new_index := NewIndex(w.raw, i)
+        if tag == DiffEqual {
+            FlushDelIns(w, *p)
+            if p.has_eq {
+                p.eq_len += OldLen(w.raw, i)
+            } else {
+                p.has_eq = true
+                p.eq_old = old_index
+                p.eq_new = new_index
+                p.eq_len = OldLen(w.raw, i)
+            }
+        } else if tag == DiffDelete {
+            FlushEq(w, *p)
+            if p.has_del {
+                p.del_len += OldLen(w.raw, i)
+            } else {
+                p.has_del = true
+                p.del_old = old_index
+                p.del_len = OldLen(w.raw, i)
+                p.del_new = new_index
+            }
+        } else if tag == DiffInsert {
+            FlushEq(w, *p)
+            if p.has_ins {
+                p.ins_len += NewLen(w.raw, i)
+            } else {
+                p.has_ins = true
+                p.ins_old = old_index
+                p.ins_new = new_index
+                p.ins_len = NewLen(w.raw, i)
+            }
+        }
+        i += 1
+    }
+    FlushEq(w, *p)
+    FlushDelIns(w, *p)
+}
+
+// Diffs the lines of two texts into `ops` (records of five s64) and returns
+// the op count, DiffNoRoom when a buffer was too small, or DiffInvalid.
+// `budget` bounds the search work like similar's deadline: once it is spent,
+// remaining differing ranges become a delete and an insert. 0 is unlimited.
+#program_export
+DiffLines :: (old_text: *u8, old_length: s64, new_text: *u8, new_length: s64, budget: s64,
+              old_starts: *s64, new_starts: *s64, old_hashes: *u64, new_hashes: *u64,
+              forward: *s64, backward: *s64, raw_ops: *s64, ops: *s64, op_capacity: s64) -> s64 {
+    if old_length < 0 || new_length < 0 || op_capacity < 0 ||
+       (old_length > 0 && old_text == null) || (new_length > 0 && new_text == null) ||
+       old_starts == null || new_starts == null || old_hashes == null || new_hashes == null ||
+       forward == null || backward == null || raw_ops == null || ops == null {
+        return DiffInvalid
+    }
+    w: Work
+    w.old_text = old_text
+    w.new_text = new_text
+    w.old_starts = old_starts
+    w.new_starts = new_starts
+    w.old_hashes = old_hashes
+    w.new_hashes = new_hashes
+    w.forward = forward
+    w.backward = backward
+    w.raw = raw_ops
+    w.raw_count = 0
+    w.ops = ops
+    w.count = 0
+    w.capacity = op_capacity
+    w.budget = budget
+    w.spent = 0
+    w.exhausted = false
+    w.overflow = false
+    old_count := SplitLines(old_text, old_length, old_starts)
+    new_count := SplitLines(new_text, new_length, new_starts)
+    HashLines(old_text, old_starts, old_count, old_hashes)
+    HashLines(new_text, new_starts, new_count, new_hashes)
+    w.offset = MaxD(old_count, new_count) + 1
+    Conquer(*w, 0, old_count, 0, new_count)
+    if w.overflow { return DiffNoRoom }
+    Cleanup(*w)
+    if w.overflow { return DiffNoRoom }
+    ReplacePass(*w)
+    if w.overflow { return DiffNoRoom }
+    return w.count
+}
+
+// ---- Unified output (similar::udiff with newline-terminated lines) ----
+
+Writer :: struct {
+    out: *u8
+    capacity: s64
+    length: s64
+}
+
+Put :: (wr: *Writer, byte: u8) {
+    if wr.length < wr.capacity { wr.out[wr.length] = byte }
+    wr.length += 1
+}
+
+PutBytes :: (wr: *Writer, data: *u8, start: s64, end: s64) {
+    at := start
+    while at < end {
+        Put(wr, data[at])
+        at += 1
+    }
+}
+
+PutText :: (wr: *Writer, text: string) {
+    at: s64 = 0
+    while at < text.count {
+        Put(wr, text[at])
+        at += 1
+    }
+}
+
+PutNumber :: (wr: *Writer, value: s64) {
+    digits: [24]u8
+    count: s64 = 0
+    rest := value
+    if rest == 0 {
+        Put(wr, cast(u8)48)
+        return
+    }
+    while rest > 0 {
+        digits[count] = cast(u8)(48 + rest % 10)
+        rest /= 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        Put(wr, digits[count])
+    }
+}
+
+PutRange :: (wr: *Writer, start: s64, end: s64) {
+    beginning := start + 1
+    length := ifx end > start then end - start else 0
+    if length == 1 {
+        PutNumber(wr, beginning)
+    } else {
+        if length == 0 { beginning -= 1 }
+        PutNumber(wr, beginning)
+        Put(wr, cast(u8)44)
+        PutNumber(wr, length)
+    }
+}
+
+// One change line: tag, the line with its terminator, and the missing-newline hint.
+PutLine :: (wr: *Writer, tag: u8, text: *u8, starts: *s64, line: s64) {
+    start := starts[line]
+    end := starts[line + 1]
+    Put(wr, tag)
+    PutBytes(wr, text, start, end)
+    last := ifx end > start then text[end - 1] else cast(u8)0
+    if end <= start || (last != cast(u8)10 && last != cast(u8)13) {
+        PutText(wr, "\n\\ No newline at end of file\n")
+    }
+}
+
+GroupOp :: struct {
+    tag: s64
+    old_index: s64
+    old_len: s64
+    new_index: s64
+    new_len: s64
+}
+
+ReadOp :: (ops: *s64, i: s64) -> GroupOp {
+    op: GroupOp
+    op.tag = ops[i * Fields]
+    op.old_index = ops[i * Fields + 1]
+    op.old_len = ops[i * Fields + 2]
+    op.new_index = ops[i * Fields + 3]
+    op.new_len = ops[i * Fields + 4]
+    return op
+}
+
+HunkState :: struct {
+    old_text: *u8
+    new_text: *u8
+    old_starts: *s64
+    new_starts: *s64
+    header_old: *u8
+    header_old_length: s64
+    header_new: *u8
+    header_new_length: s64
+    header_pending: bool
+    // The group being collected: its first op and its last op.
+    open: bool
+    first: GroupOp
+    last: GroupOp
+    group_start: s64
+    group_end: s64
+}
+
+// Writes one group of ops (ops[group_start..group_end] with the adjusted first
+// and last op held in the state) as a hunk.
+WriteGroup :: (wr: *Writer, hs: *HunkState, ops: *s64) {
+    if hs.header_pending {
+        PutText(wr, "--- ")
+        PutBytes(wr, hs.header_old, 0, hs.header_old_length)
+        Put(wr, cast(u8)10)
+        PutText(wr, "+++ ")
+        PutBytes(wr, hs.header_new, 0, hs.header_new_length)
+        Put(wr, cast(u8)10)
+        hs.header_pending = false
+    }
+    wrote_header := false
+    i := hs.group_start
+    while i < hs.group_end {
+        op := ReadOp(ops, i)
+        if i == hs.group_start { op = hs.first }
+        if i == hs.group_end - 1 { op = hs.last }
+        changes := op.old_len + op.new_len
+        if op.tag == DiffEqual { changes = op.old_len }
+        if changes > 0 && !wrote_header {
+            PutText(wr, "@@ -")
+            PutRange(wr, hs.first.old_index, hs.last.old_index + hs.last.old_len)
+            PutText(wr, " +")
+            PutRange(wr, hs.first.new_index, hs.last.new_index + hs.last.new_len)
+            PutText(wr, " @@\n")
+            wrote_header = true
+        }
+        line: s64 = 0
+        if op.tag == DiffEqual {
+            while line < op.old_len {
+                PutLine(wr, cast(u8)32, hs.old_text, hs.old_starts, op.old_index + line)
+                line += 1
+            }
+        } else {
+            while line < op.old_len {
+                PutLine(wr, cast(u8)45, hs.old_text, hs.old_starts, op.old_index + line)
+                line += 1
+            }
+            line = 0
+            while line < op.new_len {
+                PutLine(wr, cast(u8)43, hs.new_text, hs.new_starts, op.new_index + line)
+                line += 1
+            }
+        }
+        i += 1
+    }
+}
+
+// Writes the unified diff of the ops DiffLines produced, with `context` lines
+// around each change. Returns the full length; when it exceeds
+// `output_capacity` only the first `output_capacity` bytes were written.
+// `has_header` writes "--- old" and "+++ new" before the first hunk.
+#program_export
+DiffUnified :: (old_text: *u8, new_text: *u8, old_starts: *s64, new_starts: *s64,
+                ops: *s64, op_count: s64, context: s64, has_header: s32,
+                header_old: *u8, header_old_length: s64, header_new: *u8, header_new_length: s64,
+                output: *u8, output_capacity: s64) -> s64 {
+    if op_count < 0 || context < 0 || output_capacity < 0 ||
+       (op_count > 0 && ops == null) || (output_capacity > 0 && output == null) {
+        return DiffInvalid
+    }
+    wr: Writer
+    wr.out = output
+    wr.capacity = output_capacity
+    wr.length = 0
+    if op_count == 0 { return 0 }
+    hs: HunkState
+    hs.old_text = old_text
+    hs.new_text = new_text
+    hs.old_starts = old_starts
+    hs.new_starts = new_starts
+    hs.header_old = header_old
+    hs.header_old_length = header_old_length
+    hs.header_new = header_new
+    hs.header_new_length = header_new_length
+    hs.header_pending = has_header != 0
+
+    // similar::group_diff_ops: trim the first and last equal runs to the context,
+    // and split groups at equal runs longer than twice the context.
+    first := ReadOp(ops, 0)
+    if first.tag == DiffEqual {
+        offset := ifx first.old_len > context then first.old_len - context else 0
+        first.old_index += offset
+        first.new_index += offset
+        first.old_len -= offset
+        first.new_len -= offset
+    }
+    last := ReadOp(ops, op_count - 1)
+    if op_count == 1 { last = first }
+    if last.tag == DiffEqual {
+        cut := ifx last.old_len > context then last.old_len - context else 0
+        last.old_len -= cut
+        last.new_len -= cut
+    }
+    if op_count == 1 { first = last }
+
+    // Groups are runs of op indices; equal ops that split a group are rewritten.
+    group_start: s64 = 0
+    group_first := first
+    i: s64 = 0
+    while i < op_count {
+        op := ReadOp(ops, i)
+        if i == 0 { op = first }
+        if i == op_count - 1 { op = last }
+        if op.tag == DiffEqual && op.old_len > context * 2 {
+            // Close the current group with the first `context` lines of this run.
+            closing := op
+            closing.old_len = context
+            closing.new_len = context
+            hs.group_start = group_start
+            hs.group_end = i + 1
+            hs.first = ifx group_start == i then closing else group_first
+            hs.last = closing
+            WriteGroup(*wr, *hs, ops)
+            // Start the next group with the last `context` lines of this run.
+            offset := ifx op.old_len > context then op.old_len - context else 0
+            opening := op
+            opening.old_index += offset
+            opening.new_index += offset
+            opening.old_len -= offset
+            opening.new_len -= offset
+            group_start = i
+            group_first = opening
+            i += 1
+            continue
+        }
+        if i == group_start { group_first = op }
+        i += 1
+    }
+    // The final group is written unless it holds only one equal op.
+    if group_start < op_count {
+        lone_equal := group_start == op_count - 1 && group_first.tag == DiffEqual
+        if !lone_equal {
+            hs.group_start = group_start
+            hs.group_end = op_count
+            hs.first = group_first
+            hs.last = ifx group_start == op_count - 1 then group_first else last
+            WriteGroup(*wr, *hs, ops)
+        }
+    }
+    return wr.length
+}
+
+// ---- Parsing unified diffs (the rules of Rust's `diffy::Patch::from_str`) ----
+//
+// Lines split after "\n" only. Results point into the parsed text:
+//   hunks: records of DiffHunkFields s64 values: old start, old length, new
+//     start, new length, first line record, line count, and the function
+//     context after " @@ " as a start and end offset (-1, -1 when absent).
+//   lines: records of DiffLineFields s64 values: kind (DiffEqual for context,
+//     DiffDelete, DiffInsert), start and end offset of the text after the
+//     marker. The end drops the newline that "\ No newline at end of file"
+//     removes.
+//   header (6 s64): old filename start, end and quoted flag, then the same for
+//     the new filename; -1 for an absent filename. Quoted names keep their
+//     quotes and escapes; DiffUnquoteName decodes them.
+// Returns the hunk count, DiffNoRoom, DiffInvalid, or DiffParseError.
+
+DiffParseError :: -3;
+DiffHunkFields :: 8;
+DiffLineFields :: 3;
+
+LineEnd :: (text: *u8, length: s64, at: s64) -> s64 {
+    end := at
+    while end < length {
+        if text[end] == cast(u8)10 { return end + 1 }
+        end += 1
+    }
+    return length
+}
+
+Starts :: (text: *u8, at: s64, end: s64, prefix: string) -> bool {
+    if end - at < prefix.count { return false }
+    i: s64 = 0
+    while i < prefix.count {
+        if text[at + i] != prefix[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+// First offset of `needle` in text[at..end], or -1.
+Find :: (text: *u8, at: s64, end: s64, needle: string) -> s64 {
+    start := at
+    while start + needle.count <= end {
+        if Starts(text, start, end, needle) { return start }
+        start += 1
+    }
+    return -1
+}
+
+// Byte that diffy escapes inside quoted filenames.
+Escaped :: (byte: u8) -> bool {
+    return byte == cast(u8)10 || byte == cast(u8)9 || byte == cast(u8)0 ||
+           byte == cast(u8)13 || byte == cast(u8)34 || byte == cast(u8)92
+}
+
+// Decodes a quoted name's escapes (without its quotes) into `output`;
+// returns the decoded length, DiffParseError for a bad escape, or the
+// needed length when it exceeds `capacity`.
+#program_export
+DiffUnquoteName :: (text: *u8, start: s64, end: s64, output: *u8, capacity: s64) -> s64 {
+    at := start
+    length: s64 = 0
+    while at < end {
+        byte := text[at]
+        if byte == cast(u8)92 {
+            if at + 1 >= end { return DiffParseError }
+            at += 1
+            code := text[at]
+            if code == cast(u8)110 {
+                byte = cast(u8)10
+            } else if code == cast(u8)116 {
+                byte = cast(u8)9
+            } else if code == cast(u8)48 {
+                byte = cast(u8)0
+            } else if code == cast(u8)114 {
+                byte = cast(u8)13
+            } else if code == cast(u8)34 || code == cast(u8)92 {
+                byte = code
+            } else {
+                return DiffParseError
+            }
+        } else if Escaped(byte) {
+            return DiffParseError
+        }
+        if length < capacity { output[length] = byte }
+        length += 1
+        at += 1
+    }
+    return length
+}
+
+// Parses "--- name" or "+++ name" at [at, end) into header[slot..slot+3].
+ParseName :: (text: *u8, at: s64, end: s64, header: *s64, slot: s64) -> bool {
+    start := at + 4
+    stop := Find(text, start, end, "\t")
+    if stop < 0 { stop = Find(text, start, end, "\n") }
+    if stop < 0 { return false }
+    quoted := stop - start >= 2 && text[start] == cast(u8)34 && text[stop - 1] == cast(u8)34
+    if quoted {
+        scratch: [1]u8
+        if DiffUnquoteName(text, start + 1, stop - 1, *scratch[0], 0) < 0 { return false }
+    } else {
+        i := start
+        while i < stop {
+            if Escaped(text[i]) { return false }
+            i += 1
+        }
+    }
+    header[slot] = start
+    header[slot + 1] = stop
+    header[slot + 2] = ifx quoted then 1 else 0
+    return true
+}
+
+// Rust's usize parsing: an optional "+", then at least one digit.
+ParseCount :: (text: *u8, start: s64, end: s64, value: *s64) -> bool {
+    at := start
+    if at < end && text[at] == cast(u8)43 { at += 1 }
+    if at >= end { return false }
+    result: s64 = 0
+    while at < end {
+        digit := cast(s64)text[at] - 48
+        if digit < 0 || digit > 9 { return false }
+        if result > (9223372036854775807 - digit) / 10 { return false }
+        result = result * 10 + digit
+        at += 1
+    }
+    value.* = result
+    return true
+}
+
+// "start" or "start,length" (a missing length is 1).
+ParseRange :: (text: *u8, start: s64, end: s64, range_start: *s64, range_length: *s64) -> bool {
+    comma := Find(text, start, end, ",")
+    if comma < 0 {
+        range_length.* = 1
+        return ParseCount(text, start, end, range_start)
+    }
+    return ParseCount(text, start, comma, range_start) &&
+           ParseCount(text, comma + 1, end, range_length)
+}
+
+ParseHunkHeader :: (text: *u8, at: s64, end: s64, hunk: *s64) -> bool {
+    if !Starts(text, at, end, "@@ ") { return false }
+    body := at + 3
+    close := Find(text, body, end, " @@")
+    if close < 0 { return false }
+    space := Find(text, body, close, " ")
+    if space < 0 { return false }
+    if !Starts(text, body, space, "-") || !Starts(text, space + 1, close, "+") { return false }
+    if !ParseRange(text, body + 1, space, *hunk[0], *hunk[1]) { return false }
+    if !ParseRange(text, space + 2, close, *hunk[2], *hunk[3]) { return false }
+    after := close + 3
+    if after < end && text[after] == cast(u8)32 {
+        hunk[6] = after + 1
+        hunk[7] = end
+    } else {
+        hunk[6] = -1
+        hunk[7] = -1
+    }
+    return true
+}
+
+#program_export
+DiffParseUnified :: (text: *u8, length: s64, header: *s64,
+                     hunks: *s64, hunk_capacity: s64, lines: *s64, line_capacity: s64) -> s64 {
+    if length < 0 || hunk_capacity < 0 || line_capacity < 0 || header == null ||
+       (length > 0 && text == null) || (hunk_capacity > 0 && hunks == null) ||
+       (line_capacity > 0 && lines == null) {
+        return DiffInvalid
+    }
+    slot: s64 = 0
+    while slot < 6 {
+        header[slot] = -1
+        slot += 1
+    }
+    at: s64 = 0
+    // Preamble such as "diff --git" runs until a filename or hunk line.
+    while at < length {
+        end := LineEnd(text, length, at)
+        if Starts(text, at, end, "--- ") || Starts(text, at, end, "+++ ") ||
+           Starts(text, at, end, "@@ ") { break }
+        at = end
+    }
+    while at < length {
+        end := LineEnd(text, length, at)
+        if Starts(text, at, end, "--- ") {
+            if header[0] >= 0 || !ParseName(text, at, end, header, 0) { return DiffParseError }
+        } else if Starts(text, at, end, "+++ ") {
+            if header[3] >= 0 || !ParseName(text, at, end, header, 3) { return DiffParseError }
+        } else {
+            break
+        }
+        at = end
+    }
+    hunk_count: s64 = 0
+    line_count: s64 = 0
+    room := true
+    while at < length {
+        hunk: [8]s64
+        end := LineEnd(text, length, at)
+        if !ParseHunkHeader(text, at, end, *hunk[0]) { return DiffParseError }
+        at = end
+        first_line := line_count
+        // The last record's slot, and the line text kept for the newline marker.
+        no_newline_context := false
+        no_newline_delete := false
+        no_newline_insert := false
+        old_seen: s64 = 0
+        new_seen: s64 = 0
+        last_kind: s64 = -1
+        last_start: s64 = 0
+        last_end: s64 = 0
+        while at < length {
+            end = LineEnd(text, length, at)
+            kind: s64 = -1
+            start: s64 = 0
+            stop := end
+            if text[at] == cast(u8)64 { break }
+            if no_newline_context { return DiffParseError }
+            if text[at] == cast(u8)32 {
+                kind = DiffEqual
+                start = at + 1
+            } else if text[at] == cast(u8)10 {
+                kind = DiffEqual
+                start = at
+            } else if text[at] == cast(u8)45 {
+                if no_newline_delete { return DiffParseError }
+                kind = DiffDelete
+                start = at + 1
+            } else if text[at] == cast(u8)43 {
+                if no_newline_insert { return DiffParseError }
+                kind = DiffInsert
+                start = at + 1
+            } else if Starts(text, at, end, "\\ No newline at end of file") {
+                if last_kind < 0 { return DiffParseError }
+                if last_end <= last_start || text[last_end - 1] != cast(u8)10 { return DiffParseError }
+                last_end -= 1
+                if last_kind == DiffEqual { no_newline_context = true }
+                if last_kind == DiffDelete { no_newline_delete = true }
+                if last_kind == DiffInsert { no_newline_insert = true }
+                if room { lines[(line_count - 1) * DiffLineFields + 2] = last_end }
+                at = end
+                continue
+            } else {
+                return DiffParseError
+            }
+            if line_count >= line_capacity { room = false }
+            if room {
+                record := line_count * DiffLineFields
+                lines[record] = kind
+                lines[record + 1] = start
+                lines[record + 2] = stop
+            }
+            line_count += 1
+            if kind != DiffInsert { old_seen += 1 }
+            if kind != DiffDelete { new_seen += 1 }
+            last_kind = kind
+            last_start = start
+            last_end = stop
+            at = end
+        }
+        if old_seen != hunk[1] || new_seen != hunk[3] { return DiffParseError }
+        hunk[4] = first_line
+        hunk[5] = line_count - first_line
+        if hunk_count > 0 && room {
+            previous := (hunk_count - 1) * DiffHunkFields
+            if hunks[previous] + hunks[previous + 1] > hunk[0] ||
+               hunks[previous + 2] + hunks[previous + 3] > hunk[2] { return DiffParseError }
+        }
+        if hunk_count >= hunk_capacity { room = false }
+        if room {
+            field: s64 = 0
+            while field < DiffHunkFields {
+                hunks[hunk_count * DiffHunkFields + field] = hunk[field]
+                field += 1
+            }
+        }
+        hunk_count += 1
+    }
+    if !room { return DiffNoRoom }
+    return hunk_count
+}
